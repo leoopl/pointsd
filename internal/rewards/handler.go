@@ -4,6 +4,7 @@ package rewards
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/rentpoints/pointsd/internal/events"
@@ -25,8 +26,13 @@ func NewHandler(store ledger.Store, policy Policy, deadLetter pubsub.Publisher, 
 	return &Handler{store: store, policy: policy, deadLetter: deadLetter, log: log}
 }
 
-// Handle processes one delivery. The subscriber calls it concurrently
-// (MaxOutstandingMessages per replica), and pointsd runs several replicas.
+// Handle processes one delivery. The subscriber calls it concurrently (MaxOutstandingMessages per replica), and pointsd runs several replicas.
+//
+// Exactly one of Ack or Nack is called on every path. Ack means "done, never
+// redeliver": it is only said once the ledger confirmed the write, or when a
+// retry could never change the outcome. Nack asks the broker to redeliver
+// after a backoff; the ledger operations are idempotent, so a retry after a
+// write that did succeed is a no-op.
 func (h *Handler) Handle(ctx context.Context, msg pubsub.Message) {
 	ev, err := events.Decode(msg.Data())
 	if err != nil {
@@ -40,10 +46,18 @@ func (h *Handler) Handle(ctx context.Context, msg pubsub.Message) {
 		return
 	}
 
-	if err := h.process(ctx, ev); err != nil {
-		h.log.Error("processing failed", "payment_id", ev.PaymentID, "type", ev.Type, "err", err)
+	switch err := h.process(ctx, ev); {
+	case err == nil:
+		msg.Ack()
+	case errors.Is(err, ErrUnknownPayment):
+		h.log.Warn("reversal for unknown payment; acked for finance reconciliation",
+			"payment_id", ev.PaymentID, "member_id", ev.MemberID, "amount_cents", ev.AmountCents)
+		msg.Ack()
+	default:
+		h.log.Error("processing failed; nacking for redelivery",
+			"payment_id", ev.PaymentID, "type", ev.Type, "attempt", msg.DeliveryAttempt(), "err", err)
+		msg.Nack()
 	}
-	msg.Ack()
 }
 
 func (h *Handler) process(ctx context.Context, ev events.Payment) error {
@@ -56,55 +70,24 @@ func (h *Handler) process(ctx context.Context, ev events.Payment) error {
 	return nil
 }
 
+// award hands the ledger the uncapped points; the ledger applies the monthly cap and the once-per-payment rule in a single step.
 func (h *Handler) award(ctx context.Context, ev events.Payment) error {
-	seen, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if seen {
-		return nil
-	}
-
 	month := Month(ev.OccurredAt)
-	used, err := h.store.AwardedInMonth(ctx, ev.MemberID, month)
-	if err != nil {
-		return err
-	}
-	points := h.policy.Points(ev.AmountCents)
-	if room := h.policy.MonthlyCap - used; points > room {
-		points = max(room, 0)
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
+	_, err := h.store.Award(ctx, ledger.Entry{
 		MemberID:  ev.MemberID,
 		PaymentID: ev.PaymentID,
 		Kind:      ledger.KindAward,
-		Points:    points,
+		Points:    h.policy.Points(ev.AmountCents),
 		Month:     month,
-	})
+	}, h.policy.MonthlyCap)
+	return err
 }
 
+// reverse lets the ledger remove exactly the points the award entry holds.
 func (h *Handler) reverse(ctx context.Context, ev events.Payment) error {
-	awarded, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
+	_, err := h.store.Reverse(ctx, ev.PaymentID)
+	if errors.Is(err, ledger.ErrNotAwarded) {
+		return fmt.Errorf("%w: %s", ErrUnknownPayment, ev.PaymentID)
 	}
-	if !awarded {
-		return ErrUnknownPayment
-	}
-	done, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindReversal)
-	if err != nil {
-		return err
-	}
-	if done {
-		return nil
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
-		MemberID:  ev.MemberID,
-		PaymentID: ev.PaymentID,
-		Kind:      ledger.KindReversal,
-		Points:    -h.policy.Points(ev.AmountCents),
-		Month:     Month(ev.OccurredAt),
-	})
+	return err
 }
